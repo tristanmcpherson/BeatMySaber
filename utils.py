@@ -1,62 +1,86 @@
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from config import Config
 
-def create_attention_mask(labels, pad_token_id=-100):
-    """
-    Create an attention mask based on the labels.
-    The mask is 1 where notes are present and 0 where no notes (or padding).
-    """
-    mask = (labels != pad_token_id).int()
-    return mask
-
-from torch.nn.utils.rnn import pad_sequence
+config = Config()
 
 def collate_fn(batch):
     """
-    Custom collate function to pad sequences in the batch.
+    Custom collate function to handle variable-length sequences and labels.
     """
-    features, labels = zip(*batch)
+    # Extract features and labels from the batch
+    features_list = [item['features'] for item in batch]
+    labels_list = [item['labels'] for item in batch]
 
+    # Pad features
+    # Find the maximum sequence length in the batch
+    max_seq_len = config.seq_len
+    # Find the maximum number of frames per slice
+    frames_per_slice = config.time_steps  # Assuming consistent frames_per_slice
+    n_features = features_list[0].shape[1]        # Assuming consistent n_features
 
-    flattened_features = [feat.view(feat.size(0) * feat.size(1), -1) for feat in features]
+    # Pad sequences to the maximum length
+    padded_features = []
+    feature_masks = []
+    for seq in features_list:
+        seq_len = seq.shape[0]
+        if seq_len < max_seq_len:
+            # Pad with zeros
+            pad_size = (max_seq_len - seq_len, n_features, frames_per_slice)
+            padding = torch.zeros(pad_size)
+            seq = torch.cat([seq, padding], dim=0)
+            mask = torch.tensor([1]*seq_len + [0]*(max_seq_len - seq_len), dtype=torch.bool)
+        else:
+            mask = torch.ones(seq_len, dtype=torch.bool)
+        padded_features.append(seq)
+        feature_masks.append(mask)
+    batch_features = torch.stack(padded_features)    # Shape: [batch_size, max_seq_len, n_features, frames_per_slice]
+    batch_feature_masks = torch.stack(feature_masks)  # Shape: [batch_size, max_seq_len]
 
-    # Pad features and labels to the same length within the batch
-    # Using pad_sequence to handle sequences of different lengths
-    features_padded = pad_sequence([torch.cat(f) for f in flattened_features], batch_first=True, padding_value=0.0)
-    labels_padded = pad_sequence([torch.cat(l) for l in labels], batch_first=True, padding_value=-100)
+    # Pad labels
+    max_num_labels = 13
+    padded_labels = []
+    label_masks = []
+    for labels in labels_list:
+        num_labels = len(labels)
+        if num_labels < max_num_labels:
+            # Pad with "no note" labels
+            padding = [torch.tensor([-1.0]*5, dtype=torch.float32) for _ in range(max_num_labels - num_labels)]
+            labels.extend(padding)
+            mask = torch.tensor([1]*num_labels + [0]*(max_num_labels - num_labels), dtype=torch.bool)
+        else:
+            mask = torch.ones(num_labels, dtype=torch.bool)
+        padded_labels.append(labels)
+        label_masks.append(mask)
+    batch_labels = torch.stack(padded_labels)     # Shape: [batch_size, max_num_labels, 5]
+    batch_label_masks = torch.stack(label_masks)  # Shape: [batch_size, max_num_labels]
 
-    return features_padded, labels_padded
+    return {
+        'features': batch_features,
+        'feature_masks': batch_feature_masks,
+        'labels': batch_labels,
+        'label_masks': batch_label_masks
+    }
 
-def label_audio_frames_with_fractional_beats(features, beat_times, note_labels, bpm, feature_window_size, tolerance=0.01):
+import torch
+from collections import Counter
+
+def analyze_label_distribution(labels):
     """
-    Label each audio feature frame with Beat Saber note information based on fractional beat timings.
+    Analyzes and prints the distribution of each label in the dataset.
     
-    :param features: The audio features (MFCC, chroma, etc.).
-    :param beat_times: List of Beat Saber beat times (_time values).
-    :param note_labels: Corresponding note labels (e.g., _cutDirection, _lineIndex).
-    :param bpm: Beats per minute of the song.
-    :param feature_window_size: Time window size for each feature frame (e.g., 0.025 seconds).
-    :param tolerance: Time tolerance (in beats) for matching notes to frames.
-    :return: List of labels for each audio frame.
+    Args:
+        labels (torch.Tensor): Tensor of shape [num_samples, max_notes, num_attributes]
     """
-    # Time per beat in seconds
-    seconds_per_beat = 60 / bpm
-    
-    # Initialize frame labels with -1 (indicating no note)
-    frame_labels = [-1] * len(features)
-    
-    # Loop through the beats and assign labels to the closest audio frames
-    for beat_time, note_label in zip(beat_times, note_labels):
-        # Convert beat time to seconds
-        time_in_seconds = beat_time * seconds_per_beat
-        
-        # Convert time in seconds to frame index
-        frame_idx = int(round(time_in_seconds / feature_window_size))
-        
-        # Ensure frame index is within bounds of the feature sequence
-        if 0 <= frame_idx < len(features):
-            frame_labels[frame_idx] = note_label
-    
-    return frame_labels
+    line_index_labels = [label[1].item() for label in labels]
+    line_layer_labels = [label[2].item() for label in labels]
+    note_type_labels = [label[3].item() for label in labels]
+    cut_direction_labels = [label[4].item() for label in labels]
 
+    
+    print("Label Distribution:")
+    print("LineIndex:", Counter(line_index_labels))
+    print("LineLayer:", Counter(line_layer_labels))
+    print("NoteType:", Counter(note_type_labels))
+    print("CutDirection:", Counter(cut_direction_labels))

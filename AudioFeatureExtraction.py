@@ -9,35 +9,74 @@ import re
 import json
 from torch.utils.data import DataLoader
 
-class AudioFeatureExtractor(nn.Module):
-    def __init__(self, sample_rate=44100, n_mfcc=13, n_chroma=12, n_fft=2048, hop_length=512):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.mfcc_transform = MFCC(
-            sample_rate=sample_rate,
-            n_mfcc=n_mfcc,
-            melkwargs={'n_fft': n_fft, 'hop_length': hop_length, 'n_mels': 40}
-        )
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.n_chroma = n_chroma
+# AudioFeatureExtraction.py
 
-    def forward(self, audio):
-        # Ensure audio is float32 and mono
+import torch
+import torchaudio
+import librosa
+import numpy as np
+
+class AudioFeatureExtractor:
+    def __init__(self, sample_rate=44100, hop_length=512, n_mfcc=13, n_chroma=12):
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+        self.n_mfcc = n_mfcc
+        self.n_chroma = n_chroma
+        
+        # Define MFCC transform using torchaudio
+        self.mfcc_transform = torchaudio.transforms.MFCC(
+            sample_rate=self.sample_rate,
+            n_mfcc=self.n_mfcc,
+            melkwargs={
+                'n_fft': 2048,
+                'hop_length': self.hop_length,
+                'n_mels': 128,
+                'center': True,
+                'pad_mode': 'reflect',
+                'power': 2.0
+            }
+        )
+        
+    def __call__(self, audio):
+        """
+        Extracts MFCC and Chroma features from audio.
+        
+        Args:
+            audio (Tensor): Tensor of shape [channels, samples]
+        
+        Returns:
+            Tensor: Concatenated MFCC and Chroma features of shape [n_features, time_steps]
+        """
+        # Ensure audio is mono
         if audio.shape[0] > 1:
             audio = torch.mean(audio, dim=0, keepdim=True)
-
-        mfcc = self.mfcc_transform(audio)
-        mfcc = (mfcc - mfcc.mean()) / mfcc.std()  # Normalize MFCC
-
-        mel_specgram = MelSpectrogram(
-            sample_rate=self.sample_rate,
-            n_fft=self.n_fft,
+        
+        # Extract MFCCs using torchaudio
+        mfcc = self.mfcc_transform(audio)  # Shape: [n_mfcc, time_steps]
+        mfcc = mfcc.squeeze(0).numpy()     # Convert to NumPy array [n_mfcc, time_steps]
+        
+        # Extract Chroma Features using librosa
+        audio_np = audio.squeeze(0).numpy()  # [samples]
+        chroma = librosa.feature.chroma_stft(
+            y=audio_np,
+            sr=self.sample_rate,
             hop_length=self.hop_length,
-            n_mels=self.n_chroma
-        )(audio)
-        chroma = librosa.feature.chroma_cqt(C=mel_specgram.numpy(), sr=self.sample_rate)
-        chroma = torch.from_numpy(chroma).float()
-        chroma = (chroma - chroma.mean()) / chroma.std()  # Normalize Chroma
-
-        return torch.cat([mfcc, chroma], dim=1)
+            n_chroma=self.n_chroma
+        )  # Shape: [n_chroma, time_steps]
+        
+        # Ensure chroma and mfcc have the same number of time steps
+        min_time_steps = min(mfcc.shape[1], chroma.shape[1])
+        mfcc = mfcc[:, :min_time_steps]
+        chroma = chroma[:, :min_time_steps]
+        
+        # Concatenate MFCC and Chroma features
+        features = np.concatenate((mfcc, chroma), axis=0)  # Shape: [n_mfcc + n_chroma, time_steps]
+        
+        # Convert to PyTorch tensor
+        features_tensor = torch.tensor(features, dtype=torch.float32)
+        
+        return features_tensor  # [n_features, time_steps]
+    
+    def get_num_features(self):
+        """Returns the total number of features."""
+        return self.n_mfcc + self.n_chroma
