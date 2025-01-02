@@ -8,59 +8,47 @@ config = Config()
 def collate_fn(batch):
     """
     Custom collate function to handle variable-length sequences and labels.
+    Args:
+        batch: List of dictionaries containing 'features' and 'labels'
     """
-    # Extract features and labels from the batch
-    features_list = [item['features'] for item in batch]
-    labels_list = [item['labels'] for item in batch]
-
-    # Pad features
-    # Find the maximum sequence length in the batch
-    max_seq_len = config.seq_len
-    # Find the maximum number of frames per slice
-    frames_per_slice = config.time_steps  # Assuming consistent frames_per_slice
-    n_features = features_list[0].shape[1]        # Assuming consistent n_features
-
-    # Pad sequences to the maximum length
+    # Extract features and labels
+    features = [item['features'] for item in batch]  # List of [n_features, time_steps]
+    labels = [item['labels'] for item in batch]      # List of [max_notes, 5]
+    
+    # Get max time steps in batch
+    max_time_steps = max(feat.size(1) for feat in features)
+    
+    # Pad features and create masks
     padded_features = []
     feature_masks = []
-    for seq in features_list:
-        seq_len = seq.shape[0]
-        if seq_len < max_seq_len:
-            # Pad with zeros
-            pad_size = (max_seq_len - seq_len, n_features, frames_per_slice)
-            padding = torch.zeros(pad_size)
-            seq = torch.cat([seq, padding], dim=0)
-            mask = torch.tensor([1]*seq_len + [0]*(max_seq_len - seq_len), dtype=torch.bool)
+    
+    for feat in features:
+        n_features, time_steps = feat.size()
+        padding_size = max_time_steps - time_steps
+        
+        if padding_size > 0:
+            # Pad features
+            padded_feat = F.pad(feat, (0, padding_size), "constant", 0)
+            # Create mask (1 for real, 0 for padding)
+            mask = torch.ones(max_time_steps, dtype=torch.bool)
+            mask[time_steps:] = False
         else:
-            mask = torch.ones(seq_len, dtype=torch.bool)
-        padded_features.append(seq)
+            padded_feat = feat
+            mask = torch.ones(max_time_steps, dtype=torch.bool)
+            
+        padded_features.append(padded_feat)
         feature_masks.append(mask)
-    batch_features = torch.stack(padded_features)    # Shape: [batch_size, max_seq_len, n_features, frames_per_slice]
-    batch_feature_masks = torch.stack(feature_masks)  # Shape: [batch_size, max_seq_len]
-
-    # Pad labels
-    max_num_labels = 13
-    padded_labels = []
-    label_masks = []
-    for labels in labels_list:
-        num_labels = len(labels)
-        if num_labels < max_num_labels:
-            # Pad with "no note" labels
-            padding = [torch.tensor([-1.0]*5, dtype=torch.float32) for _ in range(max_num_labels - num_labels)]
-            labels.extend(padding)
-            mask = torch.tensor([1]*num_labels + [0]*(max_num_labels - num_labels), dtype=torch.bool)
-        else:
-            mask = torch.ones(num_labels, dtype=torch.bool)
-        padded_labels.append(labels)
-        label_masks.append(mask)
-    batch_labels = torch.stack(padded_labels)     # Shape: [batch_size, max_num_labels, 5]
-    batch_label_masks = torch.stack(label_masks)  # Shape: [batch_size, max_num_labels]
-
+    
+    # Stack everything
+    features_tensor = torch.stack(padded_features)  # [batch_size, n_features, max_time_steps]
+    feature_masks = torch.stack(feature_masks)      # [batch_size, max_time_steps]
+    labels_tensor = torch.stack(labels)             # [batch_size, max_notes, 5]
+    
     return {
-        'features': batch_features,
-        'feature_masks': batch_feature_masks,
-        'labels': batch_labels,
-        'label_masks': batch_label_masks
+        'features': features_tensor,
+        'feature_masks': feature_masks,
+        'labels': labels_tensor,
+        'label_masks': (labels_tensor[:, :, 0] != -1)  # Create mask based on beat_time_offset
     }
 
 import torch

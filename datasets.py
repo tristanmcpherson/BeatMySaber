@@ -149,32 +149,42 @@ class BeatSaberDataset(torch.utils.data.Dataset):
         return beat * (60.0 / bpm)
 
     def encode_note_properties(self, note, bpm):
-        """Encode the properties of a note into a tensor."""
+        """Encode the properties of a note into a tensor, or return None if invalid."""
+        # Validate note properties according to Beat Saber format:
+        # _lineIndex: 0-3 (4 lanes)
+        # _lineLayer: 0-2 (3 heights)
+        # _type: 0 (red), 1 (blue), 3 (bomb)
+        # _cutDirection: 
+        #   0 (up), 1 (down), 2 (left), 3 (right)
+        #   4 (up-left), 5 (up-right), 6 (down-left), 7 (down-right)
+        #   8 (dot/any direction)
+        if not (0 <= note['_lineIndex'] <= 3 and 
+                0 <= note['_lineLayer'] <= 2 and 
+                note['_type'] in [0, 1, 3] and  # Include bombs (3)
+                0 <= note['_cutDirection'] <= 8):
+            return None
+
         slice_duration_sec = self.slice_duration / 1000
         note_time_sec = self.beat_to_time(note['_time'], bpm)
-        beat_time_offset = (note_time_sec % slice_duration_sec) / slice_duration_sec  # Normalize to [0, 1]
+        beat_time_offset = (note_time_sec % slice_duration_sec) / slice_duration_sec
+
+        # Validate beat_time_offset
+        if beat_time_offset < 0:
+            return None
 
         return torch.tensor([
             beat_time_offset,
-            note['_lineIndex'],    # lineIndex is the column, [-1](0, 3)
-            note['_lineLayer'],    # lineLayer is the row, [-1](0, 2)
-            note['_type'],         # Note type [-1](0, 1, 3)
-            note['_cutDirection']      # Cut direction [-1](0 to 8)
+            note['_lineIndex'],
+            note['_lineLayer'],
+            note['_type'],
+            note['_cutDirection']
         ], dtype=torch.float32)
 
     def _prepare_song_data(self):
-        """
-        Prepares the song data by splitting it into 30-second chunks, loading audio, extracting features,
-        and aligning Beat Saber notes with these chunks.
-
-        Returns:
-            List of tuples: Each tuple contains (chunk_features, chunk_labels)
-                - chunk_features: Tensor of shape [n_features, time_steps]
-                - chunk_labels: List of encoded labels, length == max_notes
-        """
+        """Prepare song data with only valid notes."""
         song_data = []
         chunk_samples = int(self.chunk_duration_sec * self.sample_rate / self.audio_feature_extractor.hop_length)
-        max_notes = self.max_notes  # e.g., 13
+        max_notes = self.max_notes
 
         for audio_path, dat_path, bpm in self.song_files:
             # Load and preprocess audio (entire song)
@@ -187,15 +197,12 @@ class BeatSaberDataset(torch.utils.data.Dataset):
             total_frames = song_features.shape[-1]
             num_chunks = (total_frames + chunk_samples - 1) // chunk_samples  # Ceiling division
 
-            # Load the Beat Saber map (notes)
+            # Load and filter notes
             with open(dat_path, 'r') as f:
                 dat_content = json.load(f)
             notes = dat_content['_notes']
-
-            # Sort notes by time to ensure correct alignment
             notes_sorted = sorted(notes, key=lambda x: x['_time'])
 
-            # Iterate over chunks
             for i in range(num_chunks):
                 start_frame = i * chunk_samples
                 end_frame = start_frame + chunk_samples
@@ -216,28 +223,21 @@ class BeatSaberDataset(torch.utils.data.Dataset):
                     end_frame, sr=self.sample_rate, hop_length=self.audio_feature_extractor.hop_length
                 )
 
-                # Collect all notes in the current chunk
-                chunk_notes = [
-                    note for note in notes_sorted
-                    if chunk_start_time <= self.beat_to_time(note['_time'], bpm) < chunk_end_time
-                ]
+                # Collect and validate notes in the current chunk
+                chunk_notes = []
+                for note in notes_sorted:
+                    note_time = self.beat_to_time(note['_time'], bpm)
+                    if chunk_start_time <= note_time < chunk_end_time:
+                        encoded_note = self.encode_note_properties(note, bpm)
+                        if encoded_note is not None:  # Only add valid notes
+                            chunk_notes.append(encoded_note)
 
-                # Encode labels
-                chunk_labels = [self.encode_note_properties(note, bpm) for note in chunk_notes]
-
-                # Handle padding if number of labels is less than max_notes
-                num_labels = len(chunk_labels)
-                if num_labels < max_notes:
-                    num_pads = max_notes - num_labels
-                    pad_label = self.get_no_note_label()  # [5]
-                    chunk_labels.extend([pad_label] * num_pads)
-                elif num_labels > max_notes:
-                    # Truncate excess labels
-                    chunk_labels = chunk_labels[:max_notes]
-
-                # If there are no labels, pad with "no note" labels
-                if not chunk_labels:
-                    chunk_labels = [self.get_no_note_label() for _ in range(max_notes)]
+                # Handle chunk labels
+                if len(chunk_notes) > max_notes:
+                    chunk_notes = chunk_notes[:max_notes]
+                elif len(chunk_notes) < max_notes:
+                    pad_label = self.get_no_note_label()
+                    chunk_notes.extend([pad_label] * (max_notes - len(chunk_notes)))
 
                 # Ensure chunk_features has shape [n_features, time_steps]
                 assert chunk_features.shape == (self.n_features, chunk_samples), (
@@ -245,7 +245,7 @@ class BeatSaberDataset(torch.utils.data.Dataset):
                 )
 
                 # Append to song_data
-                song_data.append((chunk_features, chunk_labels))
+                song_data.append((chunk_features, chunk_notes))
 
         return song_data
 

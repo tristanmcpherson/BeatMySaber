@@ -32,18 +32,18 @@ class BeatSaberTransformerModel(pl.LightningModule):
                  nhead=8,
                  dropout=0.1,
                  learning_rate=1e-4,
-                 max_notes=13,
+                 max_notes=8,
                  num_classes=None,
                  **kwargs  # Add **kwargs to capture any additional arguments
                  ):
         super(BeatSaberTransformerModel, self).__init__()
 
-        # Avoid mutable default arguments by setting num_classes inside the method
+        # Modify default num_classes to include bombs
         if num_classes is None:
             num_classes = {
                 'lineIndex': 4,
                 'lineLayer': 3,
-                'note_type': 2,
+                'note_type': 4,  # Changed from 2 to 4 to accommodate 0,1,3
                 'cut_direction': 9
             }
         self.num_classes = num_classes  # Assign num_classes to an instance variable
@@ -78,139 +78,137 @@ class BeatSaberTransformerModel(pl.LightningModule):
             num_layers=num_layers
         )
 
-        # Output Layers
-        self.fc_beat_time_offset = nn.Linear(hidden_size, max_notes)  # Regression output per note
-
+        # Split the outputs into note presence and properties
+        self.fc_note_presence = nn.Linear(hidden_size, max_notes)  # Binary classification for note presence
+        self.fc_beat_time_offset = nn.Linear(hidden_size, max_notes)  # Only predict time for present notes
         self.fc_lineIndex = nn.Linear(hidden_size, max_notes * num_classes['lineIndex'])
         self.fc_lineLayer = nn.Linear(hidden_size, max_notes * num_classes['lineLayer'])
         self.fc_note_type = nn.Linear(hidden_size, max_notes * num_classes['note_type'])
         self.fc_cut_direction = nn.Linear(hidden_size, max_notes * num_classes['cut_direction'])
 
+        # Add attention pooling layers
+        self.attention_pooling = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+
     def forward(self, x, src_key_padding_mask=None):
         """
-        Args:
-            x: Tensor of shape [batch_size, max_seq_len, n_features, frames_per_slice]
-            src_key_padding_mask: Tensor of shape [batch_size, max_seq_len]
+        x: [batch_size, n_features, time_steps]
         """
-        batch_size, n_features, frames_per_slice = x.size()
-        # Current shape: [batch_size, n_features, seq_len] = [16, 25, 2583]
-        #x = x.permute(0, 2, 1)  # New shape: [batch_size, seq_len, n_features] = [16, 2583, 25]
-        # Permute to [batch_size, frames_per_slice, n_features]
-        x = x.permute(0, 2, 1)  # [16, 2583, 25]
-
-        # Reshape to combine batch_size and seq_len for CNN processing
-        x = x.contiguous().view(batch_size * frames_per_slice, n_features, 1)  # Example: [16*2583, 25, 1]
-
-        x = self.cnn(x)  # [batch_size * seq_len, hidden_size, frames_per_slice]
-
-        # Global average pooling over frames_per_slice dimension
-        x = torch.mean(x, dim=2)  # [batch_size * seq_len, hidden_size]
-        #x = x.permute(1, 0)
-        #
-        # # Reshape back to [batch_size, seq_len, hidden_size]
-        # x = x.view(batch_size, seq_len, -1)  # [batch_size, seq_len, hidden_size]
-
-        # Reshape back to [batch_size, frames_per_slice, hidden_size]
-        x = x.view(batch_size, frames_per_slice, -1)  # [16, 2583, hidden_size]
-
-        # Permute for Transformer [seq_len, batch_size, hidden_size]
-        x = x.permute(1, 0, 2)  # [2583, 16, hidden_size]
+        batch_size = x.size(0)
+        
+        # CNN processing
+        x = self.cnn(x)  # [batch_size, hidden_size, time_steps]
+        x = x.transpose(1, 2)  # [batch_size, time_steps, hidden_size]
+        
         # Apply positional encoding
-        x = self.pos_encoder(x)  # [batch_size, seq_len, hidden_size]
-
-        # Transformer Encoder
-        x = self.transformer_encoder(x, src_key_padding_mask=None)  # [batch_size, seq_len, hidden_size]
-
-        # Aggregate sequence information (e.g., by averaging over the sequence length)
-        x = torch.mean(x, dim=1)  # [batch_size, hidden_size]
+        x = self.pos_encoder(x)
+        
+        # Transformer
+        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
+        
+        # Apply attention pooling
+        attention_weights = self.attention_pooling(x)
+        attention_weights = F.softmax(attention_weights, dim=1)
+        x = torch.bmm(attention_weights.transpose(1, 2), x)  # [batch_size, 1, hidden_size]
+        x = x.squeeze(1)  # [batch_size, hidden_size]
 
         # Generate outputs
-        beat_time_offset_pred = self.fc_beat_time_offset(x)  # [batch_size, max_notes]
+        note_presence = torch.sigmoid(self.fc_note_presence(x))  # [batch_size, max_notes]
+        beat_time_offset = self.fc_beat_time_offset(x)  # [batch_size, max_notes]
+        
+        # Reshape logits to [batch_size, max_notes, num_classes]
+        lineIndex = self.fc_lineIndex(x).view(batch_size, self.max_notes, -1)
+        lineLayer = self.fc_lineLayer(x).view(batch_size, self.max_notes, -1)
+        note_type = self.fc_note_type(x).view(batch_size, self.max_notes, -1)
+        cut_direction = self.fc_cut_direction(x).view(batch_size, self.max_notes, -1)
 
-        # Generate classification logits and reshape to [batch_size, max_notes, num_classes]
-        lineIndex_logits = self.fc_lineIndex(x).view(batch_size, self.max_notes, -1)  # [batch_size, max_notes, 4]
-        lineLayer_logits = self.fc_lineLayer(x).view(batch_size, self.max_notes, -1)  # [batch_size, max_notes, 3]
-        note_type_logits = self.fc_note_type(x).view(batch_size, self.max_notes, -1)  # [batch_size, max_notes, 2]
-        cut_direction_logits = self.fc_cut_direction(x).view(batch_size, self.max_notes, -1)  # [batch_size, max_notes, 9]
-
-        return beat_time_offset_pred, lineIndex_logits, lineLayer_logits, note_type_logits, cut_direction_logits
+        return note_presence, beat_time_offset, lineIndex, lineLayer, note_type, cut_direction
 
     def training_step(self, batch, batch_idx):
-        features = batch['features']  # [batch_size, seq_len, n_features, frames_per_slice]
-        feature_masks = batch['feature_masks']  # [batch_size, seq_len]
-        labels = batch['labels']  # [batch_size, max_num_labels, 5]
-        label_masks = batch['label_masks']  # [batch_size, max_num_labels]
+        features = batch['features']
+        labels = batch['labels']      # [32, 8, 5]
+        label_masks = batch['label_masks']  # [32, 8]
 
-        # Move tensors to the appropriate device
-        features = features.to(self.device)
-        feature_masks = feature_masks.to(self.device)
-        labels = labels.to(self.device)
-        label_masks = label_masks.to(self.device)
+        outputs = self(features)
+        note_presence_pred, beat_time_offset_pred, lineIndex_logits, lineLayer_logits, note_type_logits, cut_direction_logits = outputs
 
-        # Invert feature_masks to create src_key_padding_mask (True for padded positions)
-        src_key_padding_mask = ~feature_masks  # [batch_size, seq_len]
-
-        # Forward pass through the model
-        beat_time_offset_pred, lineIndex_logits, lineLayer_logits, note_type_logits, cut_direction_logits = self(
-            features,
-            src_key_padding_mask=src_key_padding_mask
+        # Flatten predictions and labels
+        labels_flat = labels.reshape(-1, 5)   # [32*8, 5]
+        
+        # Create note presence target (1 for note, 0 for no note)
+        note_presence_true = (labels_flat[:, 0] != -1).float()
+        
+        # Note presence loss (binary cross entropy)
+        loss_note_presence = F.binary_cross_entropy(
+            note_presence_pred.reshape(-1),
+            note_presence_true,
+            reduction='mean'
         )
-        # Outputs:
-        # beat_time_offset_pred: [batch_size, max_num_labels]
-        # lineIndex_logits: [batch_size, max_num_labels, num_classes_lineIndex]
-        # lineLayer_logits: [batch_size, max_num_labels, num_classes_lineLayer]
-        # note_type_logits: [batch_size, max_num_labels, num_classes_note_type]
-        # cut_direction_logits: [batch_size, max_num_labels, num_classes_cut_direction]
 
-        # Flatten labels and masks
-        batch_size, max_num_labels, _ = labels.size()
-        valid_mask = label_masks.view(batch_size * max_num_labels)  # [batch_size * max_num_labels]
-        labels_flat = labels.view(batch_size * max_num_labels, 5)  # [batch_size * max_num_labels, 5]
+        # Time offset loss - only for positions with notes
+        valid_notes_mask = (note_presence_true == 1)
+        if valid_notes_mask.any():
+            loss_time_offset = F.smooth_l1_loss(
+                beat_time_offset_pred.reshape(-1)[valid_notes_mask],
+                labels_flat[valid_notes_mask, 0]
+            )
+        else:
+            loss_time_offset = torch.tensor(0.0, device=self.device)
 
-        # Extract true labels
-        beat_time_offset_true = labels_flat[:, 0]  # [batch_size * max_num_labels]
-        lineIndex_true = labels_flat[:, 1].long()  # [batch_size * max_num_labels]
-        lineLayer_true = labels_flat[:, 2].long()
-        note_type_true = labels_flat[:, 3].long()
-        cut_direction_true = labels_flat[:, 4].long()
+        # Only compute other losses where there are actual notes
+        if valid_notes_mask.any():
+            loss_lineIndex = F.cross_entropy(
+                lineIndex_logits.reshape(-1, self.num_classes['lineIndex'])[valid_notes_mask],
+                labels_flat[valid_notes_mask, 1].long()
+            )
+            loss_lineLayer = F.cross_entropy(
+                lineLayer_logits.reshape(-1, self.num_classes['lineLayer'])[valid_notes_mask],
+                labels_flat[valid_notes_mask, 2].long()
+            )
+            loss_note_type = F.cross_entropy(
+                note_type_logits.reshape(-1, self.num_classes['note_type'])[valid_notes_mask],
+                labels_flat[valid_notes_mask, 3].long()
+            )
+            loss_cut_direction = F.cross_entropy(
+                cut_direction_logits.reshape(-1, self.num_classes['cut_direction'])[valid_notes_mask],
+                labels_flat[valid_notes_mask, 4].long()
+            )
+        else:
+            loss_lineIndex = loss_lineLayer = loss_note_type = loss_cut_direction = torch.tensor(0.0, device=self.device)
 
-        # Flatten predictions
-        beat_time_offset_pred = beat_time_offset_pred.view(-1)  # [batch_size * max_num_labels]
-        lineIndex_logits = lineIndex_logits.view(-1, self.hparams.num_classes['lineIndex'])
-        lineLayer_logits = lineLayer_logits.view(-1, self.hparams.num_classes['lineLayer'])
-        note_type_logits = note_type_logits.view(-1, self.hparams.num_classes['note_type'])
-        cut_direction_logits = cut_direction_logits.view(-1, self.hparams.num_classes['cut_direction'])
+        # Weight and combine losses
+        weighted_losses = {
+            'note_presence': loss_note_presence * 1.5,  # High weight for note presence
+            'time_offset': loss_time_offset * 1.0,
+            'note_type': loss_note_type * 1.0,
+            'lineIndex': loss_lineIndex * 0.8,
+            'lineLayer': loss_lineLayer * 0.8,
+            'cut_direction': loss_cut_direction * 0.6
+        }
 
-        # Apply valid_mask to predictions and labels
-        beat_time_offset_pred = beat_time_offset_pred[valid_mask]
-        beat_time_offset_true = beat_time_offset_true[valid_mask]
+        total_loss = sum(weighted_losses.values())
 
-        lineIndex_logits = lineIndex_logits[valid_mask]
-        lineIndex_true = lineIndex_true[valid_mask]
+        # Compute accuracies
+        with torch.no_grad():
+            note_presence_acc = ((note_presence_pred.reshape(-1) > 0.5) == note_presence_true).float().mean()
+            accuracies = {
+                'note_presence': note_presence_acc,
+                'lineIndex': (lineIndex_logits.reshape(-1, self.num_classes['lineIndex'])[valid_notes_mask].argmax(dim=-1) == labels_flat[valid_notes_mask, 1].long()).float().mean() if valid_notes_mask.any() else torch.tensor(0.0, device=self.device),
+                'lineLayer': (lineLayer_logits.reshape(-1, self.num_classes['lineLayer'])[valid_notes_mask].argmax(dim=-1) == labels_flat[valid_notes_mask, 2].long()).float().mean() if valid_notes_mask.any() else torch.tensor(0.0, device=self.device),
+                'note_type': (note_type_logits.reshape(-1, self.num_classes['note_type'])[valid_notes_mask].argmax(dim=-1) == labels_flat[valid_notes_mask, 3].long()).float().mean() if valid_notes_mask.any() else torch.tensor(0.0, device=self.device),
+                'cut_direction': (cut_direction_logits.reshape(-1, self.num_classes['cut_direction'])[valid_notes_mask].argmax(dim=-1) == labels_flat[valid_notes_mask, 4].long()).float().mean() if valid_notes_mask.any() else torch.tensor(0.0, device=self.device)
+            }
 
-        lineLayer_logits = lineLayer_logits[valid_mask]
-        lineLayer_true = lineLayer_true[valid_mask]
+        # Logging
+        for name, loss in weighted_losses.items():
+            self.log(f'train_loss_{name}', loss, on_step=True, on_epoch=True, prog_bar=True)
+            if name in accuracies:
+                self.log(f'train_acc_{name}', accuracies[name], on_step=True, on_epoch=True, prog_bar=True)
 
-        note_type_logits = note_type_logits[valid_mask]
-        note_type_true = note_type_true[valid_mask]
-
-        cut_direction_logits = cut_direction_logits[valid_mask]
-        cut_direction_true = cut_direction_true[valid_mask]
-
-        # Compute losses
-        loss_time_offset = F.mse_loss(beat_time_offset_pred, beat_time_offset_true)
-
-        loss_lineIndex = F.cross_entropy(lineIndex_logits, lineIndex_true)
-        loss_lineLayer = F.cross_entropy(lineLayer_logits, lineLayer_true)
-        loss_note_type = F.cross_entropy(note_type_logits, note_type_true)
-        loss_cut_direction = F.cross_entropy(cut_direction_logits, cut_direction_true)
-
-        # Total loss
-        total_loss = loss_time_offset + loss_lineIndex + loss_lineLayer + loss_note_type + loss_cut_direction
-
-        # Logging losses
         self.log('train_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
-
         return total_loss
 
     def configure_optimizers(self):
